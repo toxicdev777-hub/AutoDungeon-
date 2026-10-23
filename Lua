@@ -1,0 +1,643 @@
+-- Soon Hub V2 | Auto Dungeon (Quantum logic + Fluent UI)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local Player = Players.LocalPlayer
+local PlayerGui = Player:WaitForChild("PlayerGui")
+
+-- ========== STATE ==========
+getgenv().SoonDungeon = getgenv().SoonDungeon or {}
+local G = getgenv().SoonDungeon
+local function d(k, v) if G[k] == nil then G[k] = v end end
+
+d("AutoDungeon", false)
+d("AutoDestroy", false)
+d("AutoCards", false)
+d("SelectedCard", "Hyper")
+d("TweenSpeed", 250)
+d("Distance", 20)
+d("FA", false)
+d("Bring", false)
+d("V3", false)
+d("V4", false)
+d("Weapon", "Melee")
+
+local CARDS = {"Hyper", "Overflow", "Fortress", "Shadow", "Sniper", "Lifesteal", "Burst", "Agile"}
+local WEAPONS = {"Melee", "Sword", "Fruit", "Gun"}
+
+-- ========== SERVICES / REFS ==========
+local function HRP(c)
+	return c and (c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart)
+end
+
+local function getNet()
+	local m = ReplicatedStorage:FindFirstChild("Modules")
+	return m and m:FindFirstChild("Net")
+end
+
+local function dungeonRF()
+	local net = getNet()
+	return net and (net:FindFirstChild("RF/DungeonNPCNetworkFunction") or net:FindFirstChild("DungeonNPCNetworkFunction"))
+end
+
+local function noclip(on)
+	local c = Player.Character
+	if not c then return end
+	for _, p in pairs(c:GetDescendants()) do
+		if p:IsA("BasePart") then p.CanCollide = not on end
+	end
+end
+
+-- Quantum-style tween (fly to position)
+local function topos(cf)
+	local hrp = HRP(Player.Character)
+	if not hrp then return end
+	noclip(true)
+	local goal = typeof(cf) == "CFrame" and cf or CFrame.new(cf)
+	local speed = math.max(G.TweenSpeed or 250, 50)
+	local dist = (hrp.Position - goal.Position).Magnitude
+	local step = speed / 60
+	if dist > 3 then
+		hrp.CFrame = CFrame.new(
+			hrp.Position + (goal.Position - hrp.Position).Unit * math.min(dist, step),
+			goal.Position
+		)
+	else
+		hrp.CFrame = goal
+	end
+	hrp.AssemblyLinearVelocity = Vector3.zero
+end
+
+local function equipWeapon()
+	local kind = G.Weapon or "Melee"
+	local char = Player.Character
+	if not char then return nil end
+	local function match(t)
+		local tip = tostring(t.ToolTip or "")
+		local n = string.lower(t.Name)
+		if kind == "Fruit" then return tip == "Blox Fruit" or n:find("fruit")
+		elseif kind == "Gun" then return tip == "Gun"
+		elseif kind == "Sword" then return tip == "Sword"
+		else return tip == "Melee" or tip == "Combat" end
+	end
+	for _, t in ipairs(char:GetChildren()) do
+		if t:IsA("Tool") and match(t) then return t end
+	end
+	for _, t in ipairs(Player.Backpack:GetChildren()) do
+		if t:IsA("Tool") and match(t) then
+			t.Parent = char
+			return t
+		end
+	end
+	return nil
+end
+
+local function autoHaki()
+	pcall(function()
+		local c = ReplicatedStorage:FindFirstChild("Remotes")
+		if c and c:FindFirstChild("CommF_") then
+			c.CommF_:InvokeServer("Buso")
+		end
+	end)
+end
+
+local function attack(target)
+	if not target or not target.Parent then return end
+	local part = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
+	if not part then return end
+	local tool = equipWeapon()
+	if tool then
+		local mp = tool:FindFirstChild("MousePos")
+		if mp and mp:IsA("Vector3Value") then mp.Value = part.Position end
+		pcall(function() tool:Activate() end)
+	end
+	local Net = getNet()
+	local RA = Net and Net:FindFirstChild("RE/RegisterAttack")
+	local RH = Net and Net:FindFirstChild("RE/RegisterHit")
+	if RA and RH then
+		pcall(function()
+			RA:FireServer(0.01)
+			RH:FireServer(target:FindFirstChild("Head") or part, {{target, part}})
+		end)
+	end
+end
+
+-- ========== QUANTUM DUNGEON HELPERS ==========
+local function getDungeon()
+	local map = Workspace:FindFirstChild("Map")
+	return map and map:FindFirstChild("Dungeon")
+end
+
+-- fn31: current floor by XZ distance inside extents
+local function getCurrentFloor()
+	local dungeon = getDungeon()
+	if not dungeon then return nil, 0 end
+	local hrp = HRP(Player.Character)
+	if not hrp then return nil, 0 end
+	local pos = hrp.Position
+	local best, bestDist, idx = nil, math.huge, 0
+	for i = 1, 100 do
+		local floor = dungeon:FindFirstChild(tostring(i))
+		if floor then
+			local ok, pivot = pcall(function() return floor:GetPivot().Position end)
+			local ok2, extents = pcall(function() return floor:GetExtentsSize() end)
+			if ok and pivot then
+				local d = math.sqrt((pos.X - pivot.X) ^ 2 + (pos.Z - pivot.Z) ^ 2)
+				local radius = 300
+				if ok2 and extents then
+					radius = math.max(extents.X, extents.Z) / 2 + 300
+				end
+				if d < radius and d < bestDist then
+					bestDist = d
+					best = floor
+					idx = i
+				end
+			end
+		end
+	end
+	return best, idx
+end
+
+-- fn32: enemies on floor
+local function getFloorEnemies(floor)
+	local list = {}
+	if not floor then return list end
+	local ok, pivot = pcall(function() return floor:GetPivot().Position end)
+	local ok2, extents = pcall(function() return floor:GetExtentsSize() end)
+	if not ok then return list end
+	local radius = 300
+	if ok2 and extents then
+		radius = math.max(extents.X, extents.Z) / 2 + 300
+	end
+	local en = Workspace:FindFirstChild("Enemies")
+	if not en then return list end
+	for _, child in ipairs(en:GetChildren()) do
+		local hum = child:FindFirstChild("Humanoid") or child:FindFirstChildOfClass("Humanoid")
+		local r = child:FindFirstChild("HumanoidRootPart")
+		if hum and hum.Health > 0 and r and child.Name ~= "Blank Buddy"
+			and not string.find(string.lower(child.Name), "shadow") then
+			local d = math.sqrt((pivot.X - r.Position.X) ^ 2 + (pivot.Z - r.Position.Z) ^ 2)
+			if d < radius then
+				table.insert(list, child)
+			end
+		end
+	end
+	return list
+end
+
+-- GetDungeonProps
+local function getDungeonProps(floor)
+	if not floor or not floor:FindFirstChild("Props") then return nil end
+	for _, p in ipairs(floor.Props:GetChildren()) do
+		if p:GetAttribute("KitsuneMarkActive") == true or p:GetAttribute("Speed") == 5 then
+			return p
+		end
+	end
+	return nil
+end
+
+-- GetDungeonIslands (exit teleporter to next floor)
+local function getDungeonExit()
+	local dungeon = getDungeon()
+	if not dungeon then return nil end
+	local hrp = HRP(Player.Character)
+	if not hrp then return nil end
+	local best, bestDist, idx = nil, math.huge, 0
+	for i = 1, 100 do
+		local floor = dungeon:FindFirstChild(tostring(i))
+		if floor then
+			local ok, pivot = pcall(function() return floor:GetPivot().Position end)
+			local ok2, extents = pcall(function() return floor:GetExtentsSize() end)
+			if ok and pivot then
+				local mag = (hrp.Position - pivot).Magnitude
+				local radius = 100
+				if ok2 and extents then
+					radius = math.max(extents.X, extents.Y, extents.Z) / 2 + 100
+				end
+				if mag < radius and mag < bestDist then
+					bestDist = mag
+					best = floor
+					idx = i
+				end
+			end
+		end
+	end
+	if not best then return nil end
+	if not dungeon:FindFirstChild(tostring(idx + 1)) then return nil end
+	if best:FindFirstChild("ExitTeleporter") and best.ExitTeleporter:FindFirstChild("Root") then
+		return best.ExitTeleporter.Root
+	end
+	return nil
+end
+
+local function bringEnemies(centerTarget)
+	if not G.Bring then return end
+	local center = centerTarget and (centerTarget:FindFirstChild("HumanoidRootPart") or centerTarget.PrimaryPart)
+	if not center then return end
+	local en = Workspace:FindFirstChild("Enemies")
+	if not en then return end
+	for _, e in ipairs(en:GetChildren()) do
+		local h = e:FindFirstChildOfClass("Humanoid")
+		local r = e:FindFirstChild("HumanoidRootPart")
+		if h and h.Health > 0 and r and e ~= centerTarget then
+			if (r.Position - center.Position).Magnitude <= 250 then
+				r.CFrame = center.CFrame * CFrame.new(0, -2, 0)
+				r.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+	end
+end
+
+local function tpDungeonHub()
+	pcall(function()
+		local rf = dungeonRF()
+		if rf then
+			rf:InvokeServer("TeleportToDungeonHub", false)
+		end
+	end)
+	-- fallback yellow server button style remote attempts
+	pcall(function()
+		local net = getNet()
+		if net then
+			for _, name in ipairs({
+				"RF/DungeonNPCNetworkFunction",
+				"DungeonNPCNetworkFunction",
+			}) do
+				local r = net:FindFirstChild(name)
+				if r then
+					pcall(function() r:InvokeServer("TeleportToDungeonHub", false) end)
+					pcall(function() r:InvokeServer("TeleportToDungeonHub") end)
+				end
+			end
+		end
+	end)
+end
+
+local function selectCards()
+	local selection = G.SelectedCard
+	if not selection then return end
+	local list = type(selection) == "table" and selection or { selection }
+	if #list == 0 then return end
+	for _, descendant in ipairs(Player.PlayerGui:GetDescendants()) do
+		if descendant:IsA("TextLabel") and descendant.Name == "DisplayName" and descendant.Text then
+			local text = string.lower(descendant.Text:gsub("<[^>]+>", ""))
+			for _, card in ipairs(list) do
+				if string.find(text, string.lower(card)) then
+					local parent = descendant.Parent
+					if parent and parent.Activated then
+						pcall(function() firesignal(parent.Activated) end)
+						return true
+					end
+					if parent and parent:IsA("GuiButton") then
+						pcall(function() firesignal(parent.MouseButton1Click) end)
+						return true
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ========== LOOPS (Quantum AutoDungeonFull) ==========
+local lastFloorIdx = 0
+
+task.spawn(function()
+	while true do
+		if G.AutoDungeon then
+			local dungeon = getDungeon()
+			if dungeon then
+				local floor, floorIdx = getCurrentFloor()
+				local enemies = getFloorEnemies(floor)
+
+				-- Auto Destroy Events (shrines/vents) when same floor
+				if G.AutoDestroy and floorIdx == lastFloorIdx then
+					local prop = getDungeonProps(floor)
+					if prop then
+						local pos
+						pcall(function() pos = prop:GetPivot().Position end)
+						if pos then
+							if Player:DistanceFromCharacter(pos) > 10 then
+								topos(CFrame.new(pos + Vector3.new(0, 5, 0)))
+							else
+								equipWeapon()
+								autoHaki()
+								local part = prop:FindFirstChildWhichIsA("BasePart", true) or prop
+								local tool = Player.Character and Player.Character:FindFirstChildOfClass("Tool")
+								if tool then pcall(function() tool:Activate() end) end
+								local Net = getNet()
+								local RA = Net and Net:FindFirstChild("RE/RegisterAttack")
+								local RH = Net and Net:FindFirstChild("RE/RegisterHit")
+								if RA and RH then
+									pcall(function()
+										RA:FireServer(0.01)
+										RH:FireServer(part, {{prop, part}})
+									end)
+								end
+							end
+							task.wait(0.05)
+							-- continue loop
+						end
+					end
+				end
+
+				-- wait briefly for enemies to load
+				if #enemies == 0 then
+					local t0 = tick()
+					while tick() - t0 < 2 do
+						task.wait(0.5)
+						floor, floorIdx = getCurrentFloor()
+						enemies = getFloorEnemies(floor)
+						if #enemies > 0 then break end
+					end
+				end
+
+				if #enemies > 0 then
+					lastFloorIdx = floorIdx
+					local target = enemies[1]
+					local tr = target:FindFirstChild("HumanoidRootPart")
+					if tr then
+						local floorY = 0
+						pcall(function() floorY = floor:GetPivot().Position.Y end)
+						local offsetY = G.Distance or 20
+						if tr.Position.Y > floorY + 100 then
+							offsetY = 0
+						end
+						local tool = Player.Character and Player.Character:FindFirstChildOfClass("Tool")
+						if tool and tool.ToolTip == "Blox Fruit" and tool.Name ~= "Ice-Ice" and tool.Name ~= "Light-Light" then
+							offsetY = math.min(offsetY, 20)
+						end
+						topos(CFrame.new(tr.Position + Vector3.new(0, offsetY, 0)))
+						equipWeapon()
+						autoHaki()
+						bringEnemies(target)
+						attack(target)
+						if G.FA then
+							for i = 1, 4 do attack(target) end
+						end
+					end
+				else
+					-- advance to next floor exit
+					if floorIdx <= lastFloorIdx or #enemies == 0 then
+						local exit = getDungeonExit()
+						if exit then
+							if Player:DistanceFromCharacter(exit.Position) > 20 then
+								topos(CFrame.new(exit.Position + Vector3.new(0, 10, 0)))
+							end
+						end
+					end
+				end
+			end
+			task.wait(0.05)
+		else
+			task.wait(0.2)
+		end
+	end
+end)
+
+-- Auto Cards (Quantum)
+task.spawn(function()
+	while true do
+		if G.AutoCards then
+			selectCards()
+			task.wait(0.3)
+		else
+			task.wait(0.4)
+		end
+	end
+end)
+
+-- Fast Attack standalone
+task.spawn(function()
+	while true do
+		if G.FA and not G.AutoDungeon then
+			local en = Workspace:FindFirstChild("Enemies")
+			local my = HRP(Player.Character)
+			if en and my then
+				for _, e in ipairs(en:GetChildren()) do
+					local h = e:FindFirstChildOfClass("Humanoid")
+					local r = e:FindFirstChild("HumanoidRootPart")
+					if h and h.Health > 0 and r and (r.Position - my.Position).Magnitude <= 60 then
+						attack(e)
+						break
+					end
+				end
+			end
+			task.wait(0.04)
+		else
+			task.wait(0.15)
+		end
+	end
+end)
+
+-- Auto V3 / V4
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if G.V3 then
+			pcall(function()
+				local r = ReplicatedStorage:FindFirstChild("Remotes")
+				if r and r:FindFirstChild("CommE") then r.CommE:FireServer("ActivateV3") end
+				if r and r:FindFirstChild("CommF_") then r.CommF_:InvokeServer("ActivateV3") end
+			end)
+		end
+		if G.V4 then
+			pcall(function()
+				local aw = Player.Backpack:FindFirstChild("Awakening")
+					or (Player.Character and Player.Character:FindFirstChild("Awakening"))
+				if aw and aw:FindFirstChild("RemoteFunction") then
+					aw.RemoteFunction:InvokeServer(true)
+				end
+			end)
+		end
+	end
+end)
+
+-- ========== FLUENT UI ==========
+local Fluent = loadstring(game:HttpGet(
+	"https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"
+))()
+
+local Window = Fluent:CreateWindow({
+	Title = "Soon Hub V2",
+	SubTitle = "Dungeon",
+	TabWidth = 130,
+	Size = UDim2.fromOffset(420, 300),
+	Acrylic = false,
+	Theme = "Dark",
+	MinimizeKey = Enum.KeyCode.RightControl
+})
+
+local Tabs = {
+	Dungeon = Window:AddTab({ Title = "Auto Dungeon", Icon = "swords" }),
+	Settings = Window:AddTab({ Title = "Settings", Icon = "settings" }),
+}
+
+-- Tab 1: Auto Dungeon
+Tabs.Dungeon:AddToggle("AutoDungeon", {
+	Title = "Auto Dungeon",
+	Default = false,
+	Callback = function(v) G.AutoDungeon = v end
+})
+
+Tabs.Dungeon:AddToggle("AutoDestroy", {
+	Title = "Auto Destruir Eventos",
+	Default = false,
+	Callback = function(v) G.AutoDestroy = v end
+})
+
+Tabs.Dungeon:AddButton({
+	Title = "Teleport Dungeon",
+	Description = "TP pro hub da dungeon (botão amarelo do server)",
+	Callback = function()
+		tpDungeonHub()
+		Fluent:Notify({ Title = "Soon Hub V2", Content = "Teleport Dungeon", Duration = 2 })
+	end
+})
+
+Tabs.Dungeon:AddDropdown("CardList", {
+	Title = "Auto Cards Lista",
+	Values = CARDS,
+	Default = 1,
+	Callback = function(v) G.SelectedCard = v end
+})
+
+Tabs.Dungeon:AddToggle("AutoCards", {
+	Title = "Auto Cards",
+	Default = false,
+	Callback = function(v) G.AutoCards = v end
+})
+
+-- Tab 2: Settings
+Tabs.Settings:AddDropdown("Weapon", {
+	Title = "Weapon",
+	Values = WEAPONS,
+	Default = 1,
+	Callback = function(v) G.Weapon = v end
+})
+
+Tabs.Settings:AddSlider("TweenSpeed", {
+	Title = "Tween Speed",
+	Default = 250,
+	Min = 50,
+	Max = 350,
+	Rounding = 0,
+	Callback = function(v) G.TweenSpeed = v end
+})
+
+Tabs.Settings:AddSlider("Distance", {
+	Title = "Distancia",
+	Default = 20,
+	Min = 0,
+	Max = 30,
+	Rounding = 0,
+	Callback = function(v) G.Distance = v end
+})
+
+Tabs.Settings:AddToggle("FastAttack", {
+	Title = "Fast Attack",
+	Default = false,
+	Callback = function(v) G.FA = v end
+})
+
+Tabs.Settings:AddToggle("BringMob", {
+	Title = "Bring Mob",
+	Default = false,
+	Callback = function(v) G.Bring = v end
+})
+
+Tabs.Settings:AddToggle("AutoV3", {
+	Title = "Auto V3",
+	Default = false,
+	Callback = function(v) G.V3 = v end
+})
+
+Tabs.Settings:AddToggle("AutoV4", {
+	Title = "Auto V4",
+	Default = false,
+	Callback = function(v) G.V4 = v end
+})
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+	Title = "Soon Hub V2",
+	Content = "Dungeon loaded",
+	Duration = 3
+})
+
+-- ========== TOGGLE (sua UI) ==========
+local old = PlayerGui:FindFirstChild("MoneyHubToggle")
+if old then old:Destroy() end
+
+local ToggleGui = Instance.new("ScreenGui")
+ToggleGui.Name = "MoneyHubToggle"
+ToggleGui.ResetOnSpawn = false
+ToggleGui.DisplayOrder = 999
+ToggleGui.Parent = PlayerGui
+
+local Toggle = Instance.new("TextButton")
+Toggle.Name = "MoneyToggle"
+Toggle.Size = UDim2.fromOffset(48, 48)
+Toggle.Position = UDim2.new(0, 20, 0.4, 0)
+Toggle.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+Toggle.Text = ""
+Toggle.TextSize = 27
+Toggle.Font = Enum.Font.GothamBold
+Toggle.TextColor3 = Color3.fromRGB(30, 30, 30)
+Toggle.AutoButtonColor = false
+Toggle.Active = true
+Toggle.Parent = ToggleGui
+
+local Corner = Instance.new("UICorner")
+Corner.CornerRadius = UDim.new(0, 12)
+Corner.Parent = Toggle
+
+local Stroke = Instance.new("UIStroke")
+Stroke.Color = Color3.fromRGB(230, 45, 58)
+Stroke.Thickness = 2
+Stroke.Parent = Toggle
+
+local dragging = false
+local moved = false
+local dragStart
+local startPosition
+
+Toggle.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		moved = false
+		dragStart = input.Position
+		startPosition = Toggle.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then return end
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+		local delta = input.Position - dragStart
+		if delta.Magnitude > 6 then moved = true end
+		Toggle.Position = UDim2.new(
+			startPosition.X.Scale,
+			startPosition.X.Offset + delta.X,
+			startPosition.Y.Scale,
+			startPosition.Y.Offset + delta.Y
+		)
+	end
+end)
+
+Toggle.Activated:Connect(function()
+	if moved then return end
+	if Window.Minimize then
+		Window:Minimize()
+	end
+end)
